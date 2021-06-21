@@ -17,7 +17,7 @@ from zipline.utils.calendars import get_calendar
 from zipline.utils.memoize import lazyval
 from pandas.tseries.offsets import DateOffset
 from datetime import timedelta
-
+from sharadar.util.logger import log
 
 @singleton
 class SQLiteAssetFinder(AssetFinder):
@@ -71,9 +71,11 @@ class SQLiteAssetFinder(AssetFinder):
         MAX_DELAY = 1.296e+16 # 5 months
         sql = "SELECT sid, value FROM ("+self._get_inner_select()+ ") t WHERE rown = %d;"
 
+        if as_of_date is None:
+            as_of_date = pd.Timestamp.today()
+
         date_check = as_of_date.value if enforce_date else 0
         cmd = sql % (', '.join(map(str, sids)), field_name, as_of_date.value, date_check, n*MAX_DELAY, n)
-        #print(cmd)
         return self.engine.execute(cmd).fetchall()      
     
     def _get_result_ttm(self, sids, field_name, as_of_date, k):
@@ -88,15 +90,37 @@ class SQLiteAssetFinder(AssetFinder):
         cmd = sql % (', '.join(map(str, sids)), field_name, as_of_date.value, as_of_date.value, m*MAX_DELAY*4, n, m)
         #print(cmd)
         return self.engine.execute(cmd).fetchall()  
-    
+
+    def get_datekey(self, sids, as_of_date, n):
+        """
+        Get the last SEC filing date.
+        """
+        sql = ("SELECT sid, start_date FROM ("
+               "SELECT sid, start_date, "
+               "ROW_NUMBER() OVER (PARTITION BY sid "
+               "ORDER BY start_date DESC) AS rown "
+               "FROM equity_supplementary_mappings "
+               "WHERE sid IN (%s) "
+               "AND field = 'revenue_arq' "
+               "AND start_date <= %d "
+               ") t WHERE rown = %d;"
+              )
+
+        cmd = sql % (', '.join(map(str, sids)), as_of_date.value, n)
+        result =  self.engine.execute(cmd).fetchall()
+        return pd.DataFrame(result).set_index(0).reindex(sids).T.values.astype('float64')
+
     @cached
     def get_fundamentals(self, sids, field_name, as_of_date=None, n=1):
         """
         n=1 is the most recent quarter or last ttm, n=2 indicate the previous quarter or ttm and so on...
-        It's different from the original zipline windows_lenght
+        It's different from the original zipline window_length
         """
         result = self._get_result(sids, field_name, as_of_date, n, enforce_date=True)
         if len(result) == 0:
+            log.warn("No result: asset_finder().get_fundamentals(%s, %s, %s, n=%s)" %
+                (sids, field_name, as_of_date, n)
+            )
             return []
         #shape: (windows lenghts=1, num of assets)
         return pd.DataFrame(result).set_index(0).reindex(sids).T.values.astype('float64')
@@ -133,8 +157,8 @@ class SQLiteAssetFinder(AssetFinder):
     @cached
     def get_fundamentals_ttm(self, sids, field_name, as_of_date=None, k=1):
         """
-        k=1 is the sum of the last twelve months, k=2 is the sum of the previouns twelve months and so on...
-        It's different from windows_lenght
+        k=1 is the sum of the last twelve months, k=2 is the sum of the previous twelve months and so on...
+        It's different from windows_length
         """
         result = self._get_result_ttm(sids, field_name + '_arq', as_of_date, k)
         if len(result) == 0:
@@ -152,10 +176,46 @@ class SQLiteAssetFinder(AssetFinder):
             return []
         return pd.DataFrame(result).set_index(0).reindex(sids, fill_value='NA').T.values
 
+    @cached
+    def get_daily_metrics(self, sids, field_name, as_of_date=pd.Timestamp.today(), n=1, calendar = get_calendar('XNYS')):
+        assert n > 0
+        sessions = calendar.sessions_window(as_of_date, -n+1)
+        query = "SELECT start_date, sid, value FROM equity_supplementary_mappings " \
+                "WHERE field ='%s' AND sid in (%s) AND start_date >= %s AND start_date <= %s" \
+                % (field_name, ",".join(map(str, sids)), sessions[0].value, sessions[-1].value)
+
+        df = pd.read_sql_query(query, self.engine)
+        df = df.pivot(index='start_date', columns='sid', values='value')
+        df = df.reindex(index=list(map(self._fmt_date, sessions)), columns=sids)
+        return df.values.astype('float64')
+
+    def _fmt_date(self, dt):
+        return dt.value
+
+    @property
+    def last_available_fundamentals_dt(self):
+        return self.last_available_dt('revenue_arq')
+
+    @property
+    def last_available_daily_metrics_dt(self):
+        return self.last_available_dt('marketcap')
+
+    def last_available_dt(self, field):
+        sql = "SELECT MAX(start_date) FROM equity_supplementary_mappings WHERE field = '%s';" % field
+        res = self.engine.execute(sql).fetchall()
+        if len(res) == 0:
+            return pd.NaT
+        return pd.Timestamp(res[0][0], tz='UTC')
+
 
 
 @singleton
 class SQLiteAssetDBWriter(AssetDBWriter):
+
+    def init_db(self, txn=None):
+        super().init_db(txn)
+        txn.execute("CREATE INDEX IF NOT EXISTS idx_start_date_field  ON equity_supplementary_mappings (start_date, field);")
+
 
     def _write_assets(self, asset_type, assets, txn, chunk_size, mapping_data=None):
         if asset_type == 'future':
@@ -260,11 +320,14 @@ class SQLiteAssetDBWriter(AssetDBWriter):
         sane = True
 
         field = 'category'
-        expected = ['ADR', 'ADR Common Stock', 'ADR Common Stock Primary Class', 'ADR Common Stock Secondary Class',
-               'ADR Preferred Stock', 'ADR Primary', 'ADR Stock Warrant', 'CEF', 'Canadian', 'Canadian Common Stock',
-               'Canadian Common Stock Primary Class', 'Canadian Preferred Stock', 'Canadian Stock Warrant', 'Domestic',
-               'Domestic Common Stock', 'Domestic Common Stock Primary Class', 'Domestic Common Stock Secondary Class',
-               'Domestic Preferred Stock', 'Domestic Primary', 'Domestic Stock Warrant', 'ETD', 'ETF', 'ETN', 'IDX']
+
+        expected = ['ADR Common Stock', 'ADR Common Stock Primary Class', 'ADR Common Stock Secondary Class',
+                    'ADR Preferred Stock', 'ADR Stock Warrant', 'CEF',
+                    'Canadian Common Stock', 'Canadian Common Stock Primary Class', 'Canadian Common Stock Secondary Class',
+                    'Canadian Preferred Stock', 'Canadian Stock Warrant',
+                    'Domestic Common Stock', 'Domestic Common Stock Primary Class', 'Domestic Common Stock Secondary Class',
+                    'Domestic Preferred Stock', 'Domestic Stock Warrant', 'ETD', 'ETF', 'ETN', 'IDX']
+
         if not self._check_field(field, expected):
             sane = False
 
@@ -274,7 +337,7 @@ class SQLiteAssetDBWriter(AssetDBWriter):
             sane = False
 
         field = 'exchange'
-        expected = ['BATS', 'INDEX', 'NASDAQ', 'NYSE', 'NYSEARCA', 'NYSEMKT', 'None', 'OTC']
+        expected = ['BATS', 'INDEX', 'NASDAQ', 'NYSE', 'NYSEARCA', 'NYSEMKT', 'OTC']
         if not self._check_field(field, expected):
             sane = False
 

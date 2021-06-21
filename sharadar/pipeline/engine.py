@@ -19,6 +19,7 @@ from zipline.pipeline.term import LoadableTerm
 from zipline.utils import paths as pth
 from zipline.pipeline.hooks.progress import ProgressHooks
 from zipline.pipeline.domain import US_EQUITIES
+from zipline.data.data_portal import DataPortal
 
 def to_string(obj):
     try:
@@ -68,7 +69,7 @@ def daily_equity_path(bundle_name, timestr, environ=None):
         environ=environ,
     )
 
-
+@cached
 def load_sharadar_bundle(name=SHARADAR_BUNDLE_NAME, timestr=SHARADAR_BUNDLE_DIR, environ=os.environ):
     return BundleData(
         asset_finder = SQLiteAssetFinder(asset_db_path(name, timestr, environ=environ),),
@@ -90,11 +91,18 @@ def _bar_reader(name=SHARADAR_BUNDLE_NAME, timestr=SHARADAR_BUNDLE_DIR, environ=
 def symbol(ticker, as_of_date=None):
     return _asset_finder().lookup_symbol(ticker, as_of_date)
 
+@cached
+def symbols(tickers, as_of_date=None):
+    return _asset_finder().lookup_symbols(tickers, as_of_date)
 
 @cached
-def symbols(ticker, as_of_date=None):
-    return _asset_finder().lookup_symbols(ticker, as_of_date)
+def sector(ticker, as_of_date=None):
+    return _asset_finder().get_info(symbol(ticker).sid, 'sector')
 
+@cached
+def sectors(tickers, as_of_date=None):
+    sids = [x.sid for x in symbols(tickers)]
+    return _asset_finder().get_info(sids, 'sector')
 
 @cached
 def sid(sid):
@@ -118,7 +126,8 @@ def make_pipeline_engine(bundle=None, start=None, end=None, live=False):
     if end is None:
         end = pd.to_datetime('today', utc=True)
 
-    pipeline_loader = USEquityPricingLoader(bundle.equity_daily_bar_reader, bundle.adjustment_reader, SimpleFXRateReader())
+    #pipeline_loader = USEquityPricingLoader(bundle.equity_daily_bar_reader, bundle.adjustment_reader, SimpleFXRateReader())
+    pipeline_loader = USEquityPricingLoader.without_fx(bundle.equity_daily_bar_reader, bundle.adjustment_reader)
 
 
     def choose_loader(column):
@@ -150,7 +159,6 @@ def to_sids(assets):
         return [x.sid for x in assets]
     return [assets.sid]
 
-
 def prices(assets, start, end, field='close', offset=0):
     """
     Get price data for assets between start and end.
@@ -158,26 +166,39 @@ def prices(assets, start, end, field='close', offset=0):
     start = trading_date(start)
     end = trading_date(end)
 
+    bundle = load_sharadar_bundle()
+    trading_calendar = bundle.equity_daily_bar_reader.trading_calendar
+
     if offset > 0:
-        start = _bar_reader().trading_calendar.sessions_window(start, -offset)[0]
+        start = trading_calendar.sessions_window(start, -offset)[0]
 
-    df = _bar_reader().load_dataframe(field, start, end, to_sids(assets))
+    bar_count = trading_calendar.session_distance(start, end)
 
-    # use Equity objects as column names
-    if hasattr(assets, '__iter__'):
-        df.columns = assets
-        return df
-    else:
-        series = df.iloc[:, 0]
-        series.name = assets
-        return series
+    data_portal = DataPortal(bundle.asset_finder,
+                             trading_calendar=trading_calendar,
+                             first_trading_day=start,
+                             equity_daily_reader=bundle.equity_daily_bar_reader,
+                             adjustment_reader=bundle.adjustment_reader)
 
+    df = data_portal.get_history_window(assets=assets, end_dt=end, bar_count=bar_count,
+                                             frequency='1d',
+                                             field=field,
+                                             data_frequency='daily')
+
+    return df if len(assets) > 1 else df.squeeze()
+
+def history(assets, as_of_date, n, field='close'):
+    as_of_date = trading_date(as_of_date)
+    trading_calendar = load_sharadar_bundle().equity_daily_bar_reader.trading_calendar
+    sessions = trading_calendar.sessions_window(as_of_date, -n + 1)
+    return prices(assets, sessions[0], sessions[-1], field)
 
 def returns(assets, start, end, periods=1, field='close'):
     """
     Fetch returns for one or more assets in a date range.
     """
-    df = prices(assets, start, end, field, periods).sort_index().pct_change(1).iloc[1:]
+    df = prices(assets, start, end, field, periods)
+    df = df.sort_index().pct_change(1).iloc[1:]
     return df
 
 
@@ -185,8 +206,13 @@ class CliProgressPublisher(object):
 
     def publish(self, model):
         try:
-            log.info("Percent completed: %3.0f%% (%s - %s): %s" % (
-            model.percent_complete, str(model.current_chunk_bounds[0].date()),
-            str(model.current_chunk_bounds[1].date()), model.current_work))
+            start = str(model.current_chunk_bounds[0].date())
+            end = str(model.current_chunk_bounds[1].date())
+            completed = model.percent_complete
+            work = model.current_work
+            if start == end:
+                log.info("Percent completed: %3.0f%% (%s): %s" % (completed, start, work))
+            else:
+                log.info("Percent completed: %3.0f%% (%s - %s): %s" % (completed, start, end, work))
         except:
             log.error("Cannot publish progress state.")

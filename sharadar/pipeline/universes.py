@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from click import progressbar
 from sharadar.pipeline.engine import make_pipeline_engine
-from sharadar.pipeline.factors import Exchange, Sector, IsDomestic, MarketCap, Fundamentals, EV
+from sharadar.pipeline.factors import Exchange, Sector, IsDomesticCommonStock, MarketCap, Fundamentals, EV
 from sharadar.util.logger import log
 from sharadar.util.output_dir import get_output_dir
 from zipline.pipeline import Pipeline, CustomFilter
@@ -91,25 +91,30 @@ def create_tradable_stocks_universe(output_dir, prices_start, prices_end):
     universe_start = prices_start.tz_localize('utc')
     universe_end = prices_end.tz_localize('utc')
     universe_last_date = UniverseReader(universes_dbpath).get_last_date(universe_name)
-    if universe_last_date is not pd.NaT:
+    if not pd.isnull(universe_last_date):
         universe_start = universe_last_date
     log.info("Start creating universe '%s' from %s to %s ..." % (universe_name, universe_start, universe_end))
     UniverseWriter(universes_dbpath).write(universe_name, screen, universe_start, universe_end)
 
 
-def TradableStocksUS():
+def StocksUS():
     return (
-        (USEquityPricing.close.latest > 3) &
-        Exchange().element_of(['NYSE', 'NASDAQ', 'NYSEMKT']) &
-        (Sector().notnull()) &
-        (~Sector().element_of(['Financial Services', 'Real Estate'])) &
-        (IsDomestic().eq(1)) &
-        (AverageDollarVolume(window_length=200) > 2.5e6) &
-        (MarketCap() > 350e6) &
-        (Fundamentals(field='revenue_arq') > 0) &
-        (Fundamentals(field='assets_arq') > 0) &
-        (Fundamentals(field='equity_arq') > 0) &
-        (EV() > 0)
+            (USEquityPricing.close.latest > 3) &
+            Exchange().element_of(['NYSE', 'NASDAQ', 'NYSEMKT']) &
+            (Sector().notnull()) &
+            (~Sector().element_of(['Financial Services', 'Real Estate', 'Energy', 'Utilities'])) &
+            (IsDomesticCommonStock().eq(1)) &
+            (Fundamentals(field='revenue_arq') > 0) &
+            (Fundamentals(field='assets_arq') > 0) &
+            (Fundamentals(field='equity_arq') > 0) &
+            (EV() > 0)
+    )
+
+def TradableStocksUS(min_percentile = 30):
+    return (
+        (StocksUS()) &
+        (AverageDollarVolume(window_length=200).percentile_between(min_percentile, 100.0, mask=StocksUS())) &
+        (MarketCap().percentile_between(min_percentile, 100.0, mask=StocksUS()))
     )
 
 
@@ -130,16 +135,15 @@ class NamedUniverse(CustomFilter):
 
 
 if __name__ == "__main__":
-    # TODO ask the dates
     universe_start = pd.to_datetime('1998-10-16', utc=True)
-    universe_end = pd.to_datetime('2020-07-07', utc=True)
+    universe_end = pd.to_datetime('2020-12-30', utc=True)
 
     from sharadar.util.output_dir import get_output_dir
     universes_dbpath = os.path.join(get_output_dir(), "universes.sqlite")
     universe_name = TRADABLE_STOCKS_US
     screen = TradableStocksUS()
     universe_last_date = UniverseReader(universes_dbpath).get_last_date(universe_name)
-    if universe_last_date is not pd.NaT:
+    if not pd.isnull(universe_last_date):
         universe_start = universe_last_date
     log.info("Start creating universe '%s' from %s to %s ..." % (universe_name, universe_start, universe_end))
     UniverseWriter(universes_dbpath).write(universe_name, screen, universe_start, universe_end)
